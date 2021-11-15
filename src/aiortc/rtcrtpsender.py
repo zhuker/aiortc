@@ -285,7 +285,7 @@ class RTCRtpSender:
         self.__log_debug("- RTP started")
 
         sequence_number = random16()
-        timestamp_origin = random32()
+        timestamp_origin = 0  # random32()
         try:
             while True:
                 if not self.__track:
