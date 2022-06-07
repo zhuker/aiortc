@@ -26,6 +26,7 @@ install_requires = [
     "google-crc32c>=1.1",
     "pyee>=9.0.0",
     "pylibsrtp>=0.5.6",
+    "websockets==10.3"
 ]
 
 extras_require = {
