@@ -83,16 +83,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="VPN over data channel")
     parser.add_argument("role", choices=["offer", "answer"])
     parser.add_argument("--verbose", "-v", action="count")
+    parser.add_argument("--allow-iface", default=None)
     add_signaling_arguments(parser)
     args = parser.parse_args()
 
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
+    allow_ifaces = None
+    if args.allow_iface is not None:
+        allow_ifaces = [args.allow_iface]
 
     tap = tuntap.Tun(name="revpn-%s" % args.role)
 
     signaling = create_signaling(args)
-    pc = RTCPeerConnection()
+    pc = RTCPeerConnection(allow_interfaces=allow_ifaces)
     if args.role == "offer":
         coro = run_offer(pc, signaling, tap)
     else:
