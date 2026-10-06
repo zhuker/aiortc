@@ -172,6 +172,24 @@ class TwccTrackerTest(TestCase):
         received = sum(1 for _, d in parsed.packet_results if d is not None)
         self.assertEqual(received, 10)
 
+    def test_feedback_serialization_sub_tick_deltas_do_not_drift(self) -> None:
+        """Deltas below the 250 us tick must not accumulate truncation error."""
+        tracker = TwccTracker()
+        arrivals = [1_024_000 + i * 100 for i in range(20)]  # 100 us apart
+        for i, arrival in enumerate(arrivals):
+            tracker.add(i, arrival)
+
+        fb = tracker.build_feedback(ssrc=100, media_ssrc=200)
+        assert fb is not None
+        from aiortc.rtp import RtcpPacket
+
+        parsed = self.ensureIsInstance(RtcpPacket.parse(bytes(fb))[0], RtcpTwccPacket)
+        ref_us = parsed.reference_time * 64000
+        for (_, recv_delta_us), arrival in zip(parsed.packet_results, arrivals):
+            assert recv_delta_us is not None
+            # Each reconstructed time stays within half a tick of the truth.
+            self.assertLessEqual(abs(ref_us + recv_delta_us - arrival), 125)
+
 
 class TwccFeedbackTest(TestCase):
     def _make_twcc_packet(

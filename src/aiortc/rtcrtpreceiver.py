@@ -35,8 +35,8 @@ from .rtp import (
     RtcpRrPacket,
     RtcpRtpfbPacket,
     RtcpSrPacket,
-    RtcpTwccPacket,
     RtpPacket,
+    TwccTracker,
     clamp_packets_lost,
     pack_remb_fci,
     unwrap_rtx,
@@ -187,83 +187,6 @@ class StreamStatistics:
     @property
     def packets_lost(self) -> int:
         return clamp_packets_lost(self.packets_expected - self.packets_received)
-
-
-class TwccTracker:
-    DELTA_UNIT_US = 250
-    REF_TIME_UNIT_US = 64_000
-
-    def __init__(self) -> None:
-        self._packets: dict[int, int] = {}  # twcc_seq -> arrival_time_us
-        self._min_seq: Optional[int] = None
-        self._max_seq: Optional[int] = None
-        self._feedback_count: int = 0
-
-    def add(self, twcc_seq: int, arrival_time_us: int) -> None:
-        if twcc_seq in self._packets:
-            return  # skip duplicates
-        self._packets[twcc_seq] = arrival_time_us
-        if self._min_seq is None or uint16_gt(self._min_seq, twcc_seq):
-            self._min_seq = twcc_seq
-        if self._max_seq is None or uint16_gt(twcc_seq, self._max_seq):
-            self._max_seq = twcc_seq
-
-    def build_feedback(self, ssrc: int, media_ssrc: int) -> Optional[RtcpTwccPacket]:
-        if self._min_seq is None or self._max_seq is None or not self._packets:
-            return None
-
-        base_seq = self._min_seq
-
-        # Iterate from min_seq to max_seq (uint16 wraparound aware)
-        seq = base_seq
-        packet_results: list[tuple[int, Optional[int]]] = []
-
-        # Find reference time from first received packet
-        ref_time_us: Optional[int] = None
-        s = base_seq
-        while True:
-            if s in self._packets:
-                ref_time_us = self._packets[s]
-                break
-            if s == self._max_seq:
-                break
-            s = (s + 1) & 0xFFFF
-        if ref_time_us is None:
-            return None
-
-        reference_time = ref_time_us // self.REF_TIME_UNIT_US
-
-        ref_base_us = reference_time * self.REF_TIME_UNIT_US
-
-        seq = base_seq
-        while True:
-            arrival = self._packets.get(seq)
-            if arrival is None:
-                packet_results.append((seq, None))
-            else:
-                recv_delta_us = arrival - ref_base_us
-                packet_results.append((seq, recv_delta_us))
-            if seq == self._max_seq:
-                break
-            seq = (seq + 1) & 0xFFFF
-
-        fb_count = self._feedback_count & 0xFF
-        self._feedback_count = (self._feedback_count + 1) & 0xFF
-
-        # Clear state
-        self._packets.clear()
-        self._min_seq = None
-        self._max_seq = None
-
-        return RtcpTwccPacket(
-            ssrc=ssrc,
-            media_ssrc=media_ssrc,
-            base_sequence_number=base_seq,
-            packet_status_count=len(packet_results),
-            reference_time=reference_time,
-            feedback_packet_count=fb_count,
-            packet_results=packet_results,
-        )
 
 
 class RemoteStreamTrack(MediaStreamTrack):
@@ -466,7 +389,11 @@ class RTCRtpReceiver:
             twcc_uri = "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
             for ext in parameters.headerExtensions:
                 if ext.uri == twcc_uri:
-                    self.__twcc_tracker = TwccTracker()
+                    # Transport-wide sequence numbers are shared by every stream on
+                    # the transport, so all receivers share the transport's tracker,
+                    # which it feeds before routing packets. A tracker per receiver
+                    # would report other streams' packets as lost.
+                    self.__twcc_tracker = self.__transport._enable_twcc()
                     break
 
             # start decoder thread
@@ -534,7 +461,12 @@ class RTCRtpReceiver:
         elif isinstance(packet, RtcpByePacket):
             self.__stop_decoder()
 
-    async def _handle_rtp_packet(self, packet: RtpPacket, arrival_time_ms: int) -> None:
+    async def _handle_rtp_packet(
+        self,
+        packet: RtpPacket,
+        arrival_time_ms: int,
+        arrival_time_us: Optional[int] = None,
+    ) -> None:
         """
         Handle an incoming RTP packet.
         """
@@ -543,16 +475,6 @@ class RTCRtpReceiver:
         # If the receiver is disabled, discard the packet.
         if not self._enabled:
             return
-
-        # feed TWCC tracker
-        if (
-            self.__twcc_tracker is not None
-            and packet.extensions.transport_sequence_number is not None
-        ):
-            self.__twcc_tracker.add(
-                packet.extensions.transport_sequence_number,
-                arrival_time_ms * 1000,
-            )
 
         # feed bitrate estimator
         if self.__remote_bitrate_estimator is not None:
@@ -654,7 +576,7 @@ class RTCRtpReceiver:
                 # TWCC feedback
                 if self.__twcc_tracker is not None and self.__rtcp_ssrc is not None:
                     twcc_packet = self.__twcc_tracker.build_feedback(
-                        ssrc=self.__rtcp_ssrc, media_ssrc=0
+                        ssrc=self.__rtcp_ssrc
                     )
                     if twcc_packet is not None:
                         await self._send_rtcp(twcc_packet)

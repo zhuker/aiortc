@@ -8,6 +8,7 @@ from typing import Any, Optional, Union
 from av import AudioFrame
 
 from .rtcrtpparameters import RTCRtpParameters
+from .utils import uint16_gt
 
 # used for NACK and retransmission
 RTP_HISTORY_SIZE = 128
@@ -665,14 +666,18 @@ class RtcpTwccPacket:
                 else:
                     abs_time_us = ref_time_us + recv_delta_us
                     delta_us = abs_time_us - last_time_us
-                    delta_ticks = delta_us // 250
+                    # Round, and advance last_time_us by the quantized delta (not
+                    # to abs_time_us): the receiver of this feedback reconstructs
+                    # arrival times by summing the encoded deltas, so tracking the
+                    # exact time here would let truncation errors accumulate.
+                    delta_ticks = (delta_us + 125) // 250
                     if 0 <= delta_ticks <= 255:
                         statuses.append(1)  # small delta
                         deltas.append((1, delta_ticks))
                     else:
                         statuses.append(2)  # large delta
                         deltas.append((2, delta_ticks))
-                    last_time_us = abs_time_us
+                    last_time_us += delta_ticks * 250
 
         # Encode chunks
         chunk_data = _encode_twcc_chunks(statuses)
@@ -991,3 +996,96 @@ def wrap_rtx(
     rtx.csrc = packet.csrc
     rtx.extensions = packet.extensions
     return rtx
+
+
+class TwccTracker:
+    DELTA_UNIT_US = 250
+    REF_TIME_UNIT_US = 64_000
+
+    def __init__(self) -> None:
+        self._packets: dict[int, int] = {}  # twcc_seq -> arrival_time_us
+        self._min_seq: Optional[int] = None
+        self._max_seq: Optional[int] = None
+        self._feedback_count: int = 0
+        self._media_ssrc: Optional[int] = None
+
+    def add(
+        self, twcc_seq: int, arrival_time_us: int, media_ssrc: Optional[int] = None
+    ) -> None:
+        if media_ssrc is not None:
+            self._media_ssrc = media_ssrc
+        if twcc_seq in self._packets:
+            return  # skip duplicates
+        self._packets[twcc_seq] = arrival_time_us
+        if self._min_seq is None or uint16_gt(self._min_seq, twcc_seq):
+            self._min_seq = twcc_seq
+        if self._max_seq is None or uint16_gt(twcc_seq, self._max_seq):
+            self._max_seq = twcc_seq
+
+    def build_feedback(
+        self, ssrc: int, media_ssrc: Optional[int] = None
+    ) -> Optional[RtcpTwccPacket]:
+        """
+        Build feedback for the packets added since the last call.
+
+        `media_ssrc` defaults to the SSRC of the most recently added packet. It must
+        be one of the remote sender's SSRCs: libwebrtc (including Chrome) silently
+        drops transport feedback whose media SSRC it does not send, e.g. 0.
+        """
+        if self._min_seq is None or self._max_seq is None or not self._packets:
+            return None
+        if media_ssrc is None:
+            media_ssrc = self._media_ssrc if self._media_ssrc is not None else 0
+
+        base_seq = self._min_seq
+
+        # Iterate from min_seq to max_seq (uint16 wraparound aware)
+        seq = base_seq
+        packet_results: list[tuple[int, Optional[int]]] = []
+
+        # Find reference time from first received packet
+        ref_time_us: Optional[int] = None
+        s = base_seq
+        while True:
+            if s in self._packets:
+                ref_time_us = self._packets[s]
+                break
+            if s == self._max_seq:
+                break
+            s = (s + 1) & 0xFFFF
+        if ref_time_us is None:
+            return None
+
+        reference_time = ref_time_us // self.REF_TIME_UNIT_US
+
+        ref_base_us = reference_time * self.REF_TIME_UNIT_US
+
+        seq = base_seq
+        while True:
+            arrival = self._packets.get(seq)
+            if arrival is None:
+                packet_results.append((seq, None))
+            else:
+                recv_delta_us = arrival - ref_base_us
+                packet_results.append((seq, recv_delta_us))
+            if seq == self._max_seq:
+                break
+            seq = (seq + 1) & 0xFFFF
+
+        fb_count = self._feedback_count & 0xFF
+        self._feedback_count = (self._feedback_count + 1) & 0xFF
+
+        # Clear state
+        self._packets.clear()
+        self._min_seq = None
+        self._max_seq = None
+
+        return RtcpTwccPacket(
+            ssrc=ssrc,
+            media_ssrc=media_ssrc,
+            base_sequence_number=base_seq,
+            packet_status_count=len(packet_results),
+            reference_time=reference_time,
+            feedback_packet_count=fb_count,
+            packet_results=packet_results,
+        )
